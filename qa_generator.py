@@ -17,10 +17,11 @@ import anthropic
 import os
 
 class QAGenerator:
-    def __init__(self, pdf_path: str, document_tags_csv: str, expert_type: str = "insurance expert", api_key: str = None):
+    def __init__(self, pdf_path: str, document_tags_csv: str, expert_type: str = "insurance expert", variations_per_question: int = 3, api_key: str = None):
         self.pdf_path = pdf_path
         self.document_tags_csv = document_tags_csv
         self.expert_type = expert_type
+        self.variations_per_question = variations_per_question
         self.full_text = ""
         self.pages = []
         self.document_tags = []
