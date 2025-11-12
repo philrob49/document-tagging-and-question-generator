@@ -11,7 +11,10 @@ python qa_generator.py input.pdf document_tags.csv output_qa.csv [expert_type]
 import re
 import csv
 import json
+import io
+import time
 from typing import List, Dict
+from collections import Counter
 import PyPDF2
 import anthropic
 import os
@@ -31,49 +34,72 @@ class QAGenerator:
     def extract_text(self):
         """Extract ALL text from PDF"""
         print("Extracting document text...")
-        with open(self.pdf_path, 'rb') as file:
-            reader = PyPDF2.PdfReader(file)
-            all_text = []
-            for page_num, page in enumerate(reader.pages, start=1):
-                text = page.extract_text()
-                self.pages.append({
-                    'page': page_num,
-                    'text': text
-                })
-                all_text.append(f"--- PAGE {page_num} ---\n{text}\n")
-            
-            self.full_text = '\n'.join(all_text)
-        print(f"Extracted {len(self.pages)} pages")
+        try:
+            with open(self.pdf_path, 'rb') as file:
+                reader = PyPDF2.PdfReader(file)
+                all_text = []
+                for page_num, page in enumerate(reader.pages, start=1):
+                    text = page.extract_text()
+                    self.pages.append({
+                        'page': page_num,
+                        'text': text
+                    })
+                    all_text.append(f"--- PAGE {page_num} ---\n{text}\n")
+
+                self.full_text = '\n'.join(all_text)
+            print(f"Extracted {len(self.pages)} pages")
+        except FileNotFoundError:
+            raise FileNotFoundError(f"PDF file not found: {self.pdf_path}")
+        except PyPDF2.errors.PdfReadError as e:
+            raise ValueError(f"Invalid or corrupted PDF file: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Error extracting PDF text: {e}")
     
     def load_document_tags(self):
         """Load the document tags from step1 CSV"""
         print(f"Loading document tags from {self.document_tags_csv}...")
-        with open(self.document_tags_csv, 'r', encoding='utf-8') as f:
-            reader = csv.DictReader(f)
-            for row in reader:
-                self.document_tags.append(row)
-                
-                # Build map of key-value pairs to their info
-                kv = f"{row['key']}:{row['value']}"
-                if kv not in self.key_value_map:
-                    self.key_value_map[kv] = []
-                self.key_value_map[kv].append({
-                    'page': row['page'],
-                    'section': row['section'],
-                    'quote': row['quote'],
-                    'long_citation': row['long_citation']
-                })
-        
-        print(f"Loaded {len(self.document_tags)} document tags")
-        print(f"Unique key-value pairs: {len(self.key_value_map)}")
-        
-        # Show distribution
-        keys = [tag['key'] for tag in self.document_tags]
-        from collections import Counter
-        key_counts = Counter(keys)
-        print("\nKey distribution:")
-        for key, count in sorted(key_counts.items()):
-            print(f"  {key}: {count} values")
+
+        required_columns = {'key', 'value', 'page', 'section', 'quote', 'long_citation'}
+
+        try:
+            with open(self.document_tags_csv, 'r', encoding='utf-8') as f:
+                reader = csv.DictReader(f)
+
+                # Check columns exist
+                if not required_columns.issubset(set(reader.fieldnames or [])):
+                    missing = required_columns - set(reader.fieldnames or [])
+                    raise ValueError(f"CSV missing required columns: {missing}")
+
+                for row in reader:
+                    self.document_tags.append(row)
+
+                    # Build map of key-value pairs to their info
+                    kv = f"{row['key']}:{row['value']}"
+                    if kv not in self.key_value_map:
+                        self.key_value_map[kv] = []
+                    self.key_value_map[kv].append({
+                        'page': row['page'],
+                        'section': row['section'],
+                        'quote': row['quote'],
+                        'long_citation': row['long_citation']
+                    })
+
+            print(f"Loaded {len(self.document_tags)} document tags")
+            print(f"Unique key-value pairs: {len(self.key_value_map)}")
+
+            # Show distribution
+            keys = [tag['key'] for tag in self.document_tags]
+            key_counts = Counter(keys)
+            print("\nKey distribution:")
+            for key, count in sorted(key_counts.items()):
+                print(f"  {key}: {count} values")
+
+        except FileNotFoundError:
+            raise FileNotFoundError(f"Tags CSV file not found: {self.document_tags_csv}")
+        except csv.Error as e:
+            raise ValueError(f"Invalid CSV format: {e}")
+        except KeyError as e:
+            raise ValueError(f"CSV row missing required field: {e}")
     
     def generate_qa_batch(self, iteration: int, batch_size: int = 30) -> str:
         """Generate a batch of Q&A pairs that cover the document tags"""
@@ -81,9 +107,15 @@ class QAGenerator:
         base_questions = batch_size // self.variations_per_question
         if base_questions < 1:
             base_questions = 1
-        
+
         print(f"\nIteration {iteration}: Generating {base_questions} base questions with {self.variations_per_question} variations each...")
-        
+
+        # Token warning for large documents
+        estimated_tokens = len(self.full_text) // 4
+        if estimated_tokens > 150000:
+            print(f"Warning: Document is very large (~{estimated_tokens} tokens)")
+            print("This may cause API errors or high costs. Consider using a smaller document.")
+
         # Build tag summary for Claude
         tag_summary = {}
         for tag in self.document_tags:
@@ -91,9 +123,9 @@ class QAGenerator:
             if key not in tag_summary:
                 tag_summary[key] = []
             tag_summary[key].append(tag['value'])
-        
+
         tag_list = "\n".join([f"  {key}: {', '.join(values[:10])}" for key, values in tag_summary.items()])
-        
+
         prompt = f"""You are a {self.expert_type} creating test questions and answers for this document.
 
 COMPLETE DOCUMENT:
@@ -112,7 +144,7 @@ VARIATION REQUIREMENTS:
 
 EXAMPLE - 3 variations of the same topic (theft coverage):
 Row 1: "What happens if my car is stolen?","If your vehicle is stolen...","P.3 - insurance.pdf",...
-Row 2: "If someone steals my vehicle, what am I covered for?","When your car is stolen...","P.3 - insurance.pdf",...  
+Row 2: "If someone steals my vehicle, what am I covered for?","When your car is stolen...","P.3 - insurance.pdf",...
 Row 3: "Does this policy cover car theft?","Yes, theft of your vehicle is covered...","P.3 - insurance.pdf",...
 
 TAGGING REQUIREMENTS (CRITICAL):
@@ -129,11 +161,35 @@ That's {base_questions} topics with {self.variations_per_question} variations ea
 
 Output CSV format directly (no markdown, no explanation)."""
 
-        response = self.client.messages.create(
-            model="claude-sonnet-4-20250514",
-            max_tokens=16000,
-            messages=[{"role": "user", "content": prompt}]
-        )
+        # API call with retry logic
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                response = self.client.messages.create(
+                    model="claude-sonnet-4-20250514",
+                    max_tokens=16000,
+                    messages=[{"role": "user", "content": prompt}]
+                )
+                break
+            except anthropic.RateLimitError as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    print(f"Rate limited. Waiting {wait_time}s before retry...")
+                    time.sleep(wait_time)
+                else:
+                    print("Rate limit exceeded after all retries")
+                    raise
+            except anthropic.APIError as e:
+                if attempt < max_retries - 1:
+                    wait_time = 2 ** attempt
+                    print(f"API error: {e}. Retrying in {wait_time}s...")
+                    time.sleep(wait_time)
+                else:
+                    print(f"API error after all retries: {e}")
+                    raise
+            except Exception as e:
+                print(f"Unexpected error during API call: {e}")
+                raise
         
         csv_content = response.content[0].text.strip()
         
@@ -148,46 +204,31 @@ Output CSV format directly (no markdown, no explanation)."""
         return csv_content
     
     def parse_qa_csv(self, csv_content: str) -> List[Dict]:
-        """Parse the Q&A CSV response"""
+        """Parse the Q&A CSV response using Python's csv module"""
         qa_pairs = []
-        lines = csv_content.split('\n')
-        
-        # Skip header
-        start_idx = 1 if lines[0].startswith('question,') else 0
-        
-        for line in lines[start_idx:]:
-            line = line.strip()
-            if not line:
-                continue
-            
-            # Parse CSV with quoted fields
-            parts = []
-            current = ""
-            in_quotes = False
-            
-            for char in line:
-                if char == '"':
-                    in_quotes = not in_quotes
-                elif char == ',' and not in_quotes:
-                    parts.append(current)
-                    current = ""
-                    continue
-                current += char
-            parts.append(current)
-            
-            if len(parts) >= 5:
-                try:
+
+        try:
+            # Use csv.DictReader for robust CSV parsing
+            reader = csv.DictReader(io.StringIO(csv_content))
+
+            for row in reader:
+                # Check if all required columns are present
+                if all(key in row for key in ['question', 'answer', 'citation', 'sbert_ranked_tags', 'meta_tags']):
                     qa_pairs.append({
-                        'question': parts[0].strip('"'),
-                        'answer': parts[1].strip('"'),
-                        'citation': parts[2].strip('"'),
-                        'sbert_ranked_tags': parts[3].strip('"'),
-                        'meta_tags': parts[4].strip('"')
+                        'question': row['question'],
+                        'answer': row['answer'],
+                        'citation': row['citation'],
+                        'sbert_ranked_tags': row['sbert_ranked_tags'],
+                        'meta_tags': row['meta_tags']
                     })
-                except Exception as e:
-                    print(f"Warning: Skipping malformed row: {str(e)}")
-                    continue
-        
+                else:
+                    print(f"Warning: Skipping row with missing columns")
+
+        except csv.Error as e:
+            print(f"Warning: CSV parsing error: {e}")
+        except Exception as e:
+            print(f"Warning: Unexpected error parsing CSV: {e}")
+
         return qa_pairs
     
     def validate_and_clean_tags(self, qa_pairs: List[Dict]) -> List[Dict]:
@@ -284,13 +325,19 @@ Output CSV format directly (no markdown, no explanation)."""
         
         # Trim to exact target
         all_qa_pairs = all_qa_pairs[:target_questions]
-        
+
         # Write to CSV
         print(f"\nWriting {len(all_qa_pairs)} Q&A pairs to {output_csv}...")
-        with open(output_csv, 'w', newline='', encoding='utf-8') as f:
-            writer = csv.DictWriter(f, fieldnames=['question', 'answer', 'citation', 'sbert_ranked_tags', 'meta_tags'])
-            writer.writeheader()
-            writer.writerows(all_qa_pairs)
+        try:
+            with open(output_csv, 'w', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=['question', 'answer', 'citation', 'sbert_ranked_tags', 'meta_tags'])
+                writer.writeheader()
+                writer.writerows(all_qa_pairs)
+            print(f"Successfully wrote output to {output_csv}")
+        except IOError as e:
+            raise IOError(f"Failed to write output file: {e}")
+        except Exception as e:
+            raise RuntimeError(f"Error writing CSV file: {e}")
         
         # Summary
         print("\n" + "="*70)
@@ -301,11 +348,18 @@ Output CSV format directly (no markdown, no explanation)."""
         # Tag usage stats
         tag_usage = {}
         for qa in all_qa_pairs:
-            meta = json.loads(qa['meta_tags'])
-            for key in meta.keys():
-                if key != 'source_file':
-                    tag_usage[key] = tag_usage.get(key, 0) + 1
-        
+            try:
+                meta = json.loads(qa['meta_tags'])
+                for key in meta.keys():
+                    if key != 'source_file':
+                        tag_usage[key] = tag_usage.get(key, 0) + 1
+            except json.JSONDecodeError:
+                # Skip rows with invalid JSON
+                continue
+            except Exception:
+                # Skip any other errors
+                continue
+
         print("\nTag usage in questions:")
         for key, count in sorted(tag_usage.items()):
             print(f"  {key}: {count} questions")
@@ -313,7 +367,7 @@ Output CSV format directly (no markdown, no explanation)."""
 
 if __name__ == "__main__":
     import sys
-    
+
     if len(sys.argv) < 4:
         print("Usage: python qa_generator.py input.pdf document_tags.csv output_qa.csv [expert_type] [num_questions] [variations]")
         print("\nParameters:")
@@ -323,13 +377,45 @@ if __name__ == "__main__":
         print("  python qa_generator.py policy.pdf tags.csv qa_output.csv 'insurance expert' 50")
         print("  python qa_generator.py medical.pdf tags.csv qa_output.csv 'medical professional' 60 5")
         sys.exit(1)
-    
+
+    # Parse arguments
     pdf_path = sys.argv[1]
     tags_csv = sys.argv[2]
     output_csv = sys.argv[3]
     expert_type = sys.argv[4] if len(sys.argv) > 4 else "insurance expert"
-    num_questions = int(sys.argv[5]) if len(sys.argv) > 5 else 100
-    variations = int(sys.argv[6]) if len(sys.argv) > 6 else 3
-    
-    generator = QAGenerator(pdf_path, tags_csv, expert_type=expert_type, variations_per_question=variations)
-    generator.process(output_csv, target_questions=num_questions)
+
+    # Validate file paths exist
+    if not os.path.exists(pdf_path):
+        print(f"Error: PDF file not found: {pdf_path}")
+        sys.exit(1)
+    if not os.path.exists(tags_csv):
+        print(f"Error: Tags CSV file not found: {tags_csv}")
+        sys.exit(1)
+
+    # Parse and validate num_questions
+    try:
+        num_questions = int(sys.argv[5]) if len(sys.argv) > 5 else 100
+        if num_questions <= 0:
+            print("Error: num_questions must be a positive integer")
+            sys.exit(1)
+    except ValueError:
+        print(f"Error: num_questions must be an integer, got: {sys.argv[5]}")
+        sys.exit(1)
+
+    # Parse and validate variations
+    try:
+        variations = int(sys.argv[6]) if len(sys.argv) > 6 else 3
+        if variations <= 0:
+            print("Error: variations must be a positive integer")
+            sys.exit(1)
+    except ValueError:
+        print(f"Error: variations must be an integer, got: {sys.argv[6]}")
+        sys.exit(1)
+
+    # Create generator and process
+    try:
+        generator = QAGenerator(pdf_path, tags_csv, expert_type=expert_type, variations_per_question=variations)
+        generator.process(output_csv, target_questions=num_questions)
+    except Exception as e:
+        print(f"\nError: {e}")
+        sys.exit(1)
